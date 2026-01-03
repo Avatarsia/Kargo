@@ -1,0 +1,30 @@
+# KARGO - Klipper Archive & Remote G-code Operations
+# Moonraker Configuration Example
+# Copy this section to your moonraker.conf file
+
+[nas_offload]
+# NAS mount point (must be already mounted via fstab)
+nas_mount_point: /mnt/nas
+
+# Directory on NAS for G-code files
+nas_gcodes_dir: /mnt/nas/klipper_gcodes
+
+# Local G-code directory (Klipper's virtual SD card)
+local_gcodes_dir: ~/printer_data/gcodes
+
+# Offload mode: hybrid (symlink + stub), symlink, or stub
+offload_mode: hybrid
+
+# Offload triggers - when to automatically offload files
+offload_on_complete: True
+offload_on_cancelled: False
+offload_on_error: False
+
+# Versioning - prevent accidental overwrites of files with same name
+# When enabled, appends timestamp to filename (e.g., test_20260103_220155.gcode)
+enable_versioning: True
+keep_versions: 5  # Keep last 5 versions, 0 = unlimited
+
+# Advanced settings (optional)
+# lock_dir: /var/run/klipper-nas-offload
+# cache_db: ~/printer_data/database/nas_offload.db
