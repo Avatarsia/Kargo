@@ -87,6 +87,20 @@ class MetadataCache:
                 CREATE INDEX IF NOT EXISTS idx_queue_queued_at 
                 ON offload_queue(queued_at)
             ''')
+            columns = {row[1] for row in cursor.execute('PRAGMA table_info(offload_queue)')}
+            if 'revision' not in columns:
+                cursor.execute('ALTER TABLE offload_queue ADD COLUMN revision INTEGER NOT NULL DEFAULT 0')
+            # Keep the oldest queued request and its retry history on upgrade.
+            cursor.execute('''
+                DELETE FROM offload_queue
+                WHERE id NOT IN (
+                    SELECT MIN(id) FROM offload_queue GROUP BY rel_path
+                )
+            ''')
+            cursor.execute('''
+                CREATE UNIQUE INDEX IF NOT EXISTS idx_queue_rel_path
+                ON offload_queue(rel_path)
+            ''')
             
             logger.info(f"Initialized metadata cache at {self.db_path}")
     
@@ -102,11 +116,18 @@ class MetadataCache:
             nas_target: NAS target name
         """
         with self._get_connection() as conn:
-            conn.execute('''
-                INSERT OR REPLACE INTO files 
-                (rel_path, size, nas_path, nas_target, offloaded_at)
-                VALUES (?, ?, ?, ?, ?)
-            ''', (rel_path, size, nas_path, nas_target, datetime.now()))
+            offloaded_at = datetime.now().isoformat(' ')
+            cursor = conn.execute('''
+                UPDATE files
+                SET size = ?, nas_path = ?, nas_target = ?, offloaded_at = ?
+                WHERE rel_path = ?
+            ''', (size, nas_path, nas_target, offloaded_at, rel_path))
+            if cursor.rowcount == 0:
+                conn.execute('''
+                    INSERT INTO files
+                    (rel_path, size, nas_path, nas_target, offloaded_at)
+                    VALUES (?, ?, ?, ?, ?)
+                ''', (rel_path, size, nas_path, nas_target, offloaded_at))
         
         logger.debug(f"Updated metadata for {rel_path}: {size} bytes")
     
@@ -127,6 +148,23 @@ class MetadataCache:
             )
             row = cursor.fetchone()
             return dict(row) if row else None
+
+    def get_files_metadata(self, rel_paths: List[str]) -> Dict[str, Dict[str, Any]]:
+        """Get existing metadata in batches using one database connection."""
+        if not rel_paths:
+            return {}
+        metadata = {}
+        with self._get_connection() as conn:
+            for start in range(0, len(rel_paths), 900):
+                batch = rel_paths[start:start + 900]
+                placeholders = ','.join('?' for _ in batch)
+                cursor = conn.execute(
+                    'SELECT * FROM files WHERE rel_path IN ({})'.format(placeholders),
+                    batch
+                )
+                for row in cursor:
+                    metadata[row['rel_path']] = dict(row)
+        return metadata
     
     def get_file_size(self, rel_path: str) -> Optional[int]:
         """
@@ -153,7 +191,7 @@ class MetadataCache:
                 UPDATE files 
                 SET last_accessed = ?, print_count = print_count + 1
                 WHERE rel_path = ?
-            ''', (datetime.now(), rel_path))
+            ''', (datetime.now().isoformat(' '), rel_path))
     
     def delete_file(self, rel_path: str) -> None:
         """
@@ -175,20 +213,26 @@ class MetadataCache:
             end_state: Print end state (complete, cancelled, error)
         """
         with self._get_connection() as conn:
-            conn.execute('''
-                INSERT INTO offload_queue 
-                (rel_path, end_state, queued_at)
-                VALUES (?, ?, ?)
-            ''', (rel_path, end_state, datetime.now()))
+            cursor = conn.execute('''
+                UPDATE offload_queue SET end_state = ?, revision = revision + 1 WHERE rel_path = ?
+            ''', (end_state, rel_path))
+            if cursor.rowcount == 0:
+                conn.execute('''
+                    INSERT INTO offload_queue
+                    (rel_path, end_state, queued_at)
+                    VALUES (?, ?, ?)
+                ''', (rel_path, end_state, datetime.now().isoformat(' ')))
         
         logger.info(f"Queued {rel_path} for retry offload")
     
-    def get_pending_offloads(self, limit: int = 10) -> List[Dict[str, Any]]:
+    def get_pending_offloads(self, limit: int = 10,
+                             after_id: int = 0) -> List[Dict[str, Any]]:
         """
         Get pending offload queue items.
         
         Args:
             limit: Maximum number of items to return
+            after_id: Return only items with IDs greater than this cursor
         
         Returns:
             List of queued offload dicts
@@ -196,12 +240,13 @@ class MetadataCache:
         with self._get_connection() as conn:
             cursor = conn.execute('''
                 SELECT * FROM offload_queue 
-                ORDER BY queued_at ASC 
+                WHERE id > ?
+                ORDER BY id ASC
                 LIMIT ?
-            ''', (limit,))
+            ''', (after_id, limit))
             return [dict(row) for row in cursor.fetchall()]
     
-    def remove_from_queue(self, queue_id: int) -> None:
+    def remove_from_queue(self, queue_id: int, revision: Optional[int] = None) -> None:
         """
         Remove item from offload queue.
         
@@ -209,7 +254,11 @@ class MetadataCache:
             queue_id: Queue item ID
         """
         with self._get_connection() as conn:
-            conn.execute('DELETE FROM offload_queue WHERE id = ?', (queue_id,))
+            if revision is None:
+                conn.execute('DELETE FROM offload_queue WHERE id = ?', (queue_id,))
+            else:
+                conn.execute('DELETE FROM offload_queue WHERE id = ? AND revision = ?',
+                             (queue_id, revision))
     
     def increment_retry(self, queue_id: int) -> None:
         """
@@ -223,7 +272,7 @@ class MetadataCache:
                 UPDATE offload_queue 
                 SET retry_count = retry_count + 1, last_retry = ?
                 WHERE id = ?
-            ''', (datetime.now(), queue_id))
+            ''', (datetime.now().isoformat(' '), queue_id))
     
     def get_statistics(self) -> Dict[str, Any]:
         """
@@ -259,7 +308,7 @@ class MetadataCache:
             conn.execute('''
                 INSERT OR REPLACE INTO config (key, value, updated_at)
                 VALUES (?, ?, ?)
-            ''', (key, value, datetime.now()))
+            ''', (key, value, datetime.now().isoformat(' ')))
     
     def get_config(self, key: str, default: str = None) -> Optional[str]:
         """

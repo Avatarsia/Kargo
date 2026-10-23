@@ -12,7 +12,10 @@ nas_gcodes_dir: /mnt/nas/klipper_gcodes
 # Local G-code directory (Klipper's virtual SD card)
 local_gcodes_dir: ~/printer_data/gcodes
 
-# Offload mode: hybrid (symlink + stub), symlink, or stub
+# Accepted requested modes: hybrid, symlink, or stub (legacy values preserved).
+# All modes now use safe stubs, even with NAS nosymfollow: realpath upload
+# consumers can bypass mount protection. API/list expose effective_mode=stub,
+# fallback and fallback_reason. Convert/quarantine legacy NAS links on upgrade.
 offload_mode: hybrid
 
 # Offload triggers - when to automatically offload files
@@ -26,5 +29,6 @@ enable_versioning: True
 keep_versions: 5  # Keep last 5 versions, 0 = unlimited
 
 # Advanced settings (optional)
-# lock_dir: /var/run/klipper-nas-offload
+# lock_dir defaults beside local_gcodes_dir under systemd/nas-offload-locks.
+lock_dir: ~/printer_data/systemd/nas-offload-locks
 # cache_db: ~/printer_data/database/nas_offload.db
