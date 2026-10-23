@@ -1,5 +1,7 @@
 """Path sanitization and validation utilities"""
 
+import os
+from contextlib import contextmanager
 from pathlib import Path
 from typing import List
 
@@ -54,6 +56,9 @@ def sanitize_path(rel_path: str, allowed_extensions: List[str] = None) -> str:
     # Check for null bytes (security)
     if '\0' in rel_path:
         raise InvalidPathError("Null bytes not allowed in path")
+
+    if any(char in rel_path for char in ('\r', '\n')):
+        raise InvalidPathError("Control characters not allowed in path")
     
     # Parse as Path object
     path = Path(rel_path)
@@ -106,3 +111,65 @@ def normalize_path(rel_path: str) -> str:
         Normalized path
     """
     return str(Path(rel_path))
+
+
+@contextmanager
+def open_directory(path: Path, create: bool = False):
+    """Pin a POSIX directory; never follow symlink components or reopen paths."""
+    path = Path(os.path.abspath(str(path)))
+    descriptor = os.open('/', os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    try:
+        for part in path.parts[1:]:
+            if create:
+                try:
+                    os.mkdir(part, dir_fd=descriptor)
+                except FileExistsError:
+                    pass
+                os.fsync(descriptor)
+            child = os.open(part, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
+                            dir_fd=descriptor)
+            os.close(descriptor)
+            descriptor = child
+        yield descriptor
+    finally:
+        os.close(descriptor)
+
+
+@contextmanager
+def rooted_parent(root: Path, rel_path: str, create: bool = False):
+    """Yield a pinned parent and basename beneath a trusted, non-symlink root."""
+    path = Path(rel_path)
+    if path.is_absolute() or '..' in path.parts or not path.name:
+        raise InvalidPathError("Path must stay beneath its root")
+    with open_directory(root, create=create) as root_fd:
+        descriptor = os.dup(root_fd)
+        try:
+            for part in path.parts[:-1]:
+                if create:
+                    try:
+                        os.mkdir(part, dir_fd=descriptor)
+                    except FileExistsError:
+                        pass
+                    os.fsync(descriptor)
+                child = os.open(part, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
+                                dir_fd=descriptor)
+                os.close(descriptor)
+                descriptor = child
+            yield descriptor, path.name
+        finally:
+            os.close(descriptor)
+
+
+def relative_to_root(path: Path, root: Path) -> str:
+    """Bound an untrusted absolute reference lexically; opening stays no-follow."""
+    root = Path(os.path.abspath(str(root)))
+    path = Path(path)
+    if not path.is_absolute() or '..' in path.parts:
+        raise InvalidPathError("Reference must be an absolute path beneath its root")
+    try:
+        relative = path.relative_to(root)
+    except ValueError as exc:
+        raise InvalidPathError("Reference leaves its root") from exc
+    if not relative.name:
+        raise InvalidPathError("Reference must name a file")
+    return str(relative)

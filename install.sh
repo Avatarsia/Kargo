@@ -338,9 +338,8 @@ setup_nas_mount() {
         print_success "Manual mount successful!"
         
         # Test write permission
-        if echo "test" | sudo tee "$NAS_MOUNT_LOCAL/.kargo_test" >/dev/null 2>&1; then
+        if test_nas_write "$NAS_MOUNT_LOCAL"; then
             print_success "Write permissions OK"
-            sudo rm -f "$NAS_MOUNT_LOCAL/.kargo_test"
         else
             print_error "No write permissions on NAS!"
             echo
@@ -353,8 +352,8 @@ setup_nas_mount() {
             echo "   - Client IP allowed: ${NAS_HOST}"
             echo
             echo "2. Check user mapping:"
-            echo "   - Disable 'root squashing' option"
-            echo "   - Or: Configure user ID mapping"
+            echo "   - Allow the Moonraker service user's UID/GID"
+            echo "   - Keep root squashing enabled"
             echo
             echo "3. Documentation:"
             echo "   - See docs/nas_setup/synology.md for details"
@@ -535,6 +534,37 @@ configure_nas() {
     return 0
 }
 
+# Probe as the service user; never follow or overwrite an existing entry.
+test_nas_write() {
+    python3 - "$1" <<'PY'
+import os
+import secrets
+import sys
+
+if os.geteuid() == 0:
+    sys.exit("Run the installer as the Moonraker service user, without sudo.")
+directory_fd = os.open(sys.argv[1], os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+try:
+    for attempt in range(10):
+        name = '.kargo-test-' + secrets.token_hex(16)
+        try:
+            fd = os.open(name, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+                         0o600, dir_fd=directory_fd)
+            break
+        except FileExistsError:
+            continue
+    else:
+        sys.exit("Unable to create an exclusive NAS write probe.")
+    try:
+        with os.fdopen(fd, 'wb') as probe:
+            probe.write(b'test\n')
+    finally:
+        os.unlink(name, dir_fd=directory_fd)
+finally:
+    os.close(directory_fd)
+PY
+}
+
 # Test NAS connection
 test_nas() {
     print_header
@@ -561,10 +591,8 @@ test_nas() {
     fi
     
     # Write test
-    local test_file="$mount_point/.nas_offload_install_test"
-    if echo "test" > "$test_file" 2>/dev/null; then
+    if test_nas_write "$mount_point"; then
         print_success "Write test successful"
-        rm -f "$test_file"
     else
         print_error "Write test failed - no write permission"
         return 1
@@ -629,7 +657,8 @@ do_install() {
     
     # Copy Moonraker component
     print_info "Installing Moonraker component..."
-    cp -r "$SCRIPT_DIR/scripts/"* "$MOONRAKER_DIR/components/"
+    cp "$SCRIPT_DIR/scripts/nas_offload.py" "$MOONRAKER_DIR/components/"
+    cp -r "$SCRIPT_DIR/scripts/utils" "$MOONRAKER_DIR/components/"
     print_success "Moonraker component installed"
     
     # Copy Klipper macros
@@ -639,6 +668,7 @@ do_install() {
     
     # Generate moonraker.conf snippet
     local moonraker_conf="$KLIPPER_CONFIG_DIR/moonraker.conf"
+    mkdir -p "$PRINTER_DATA_DIR/systemd/nas-offload-locks" "$PRINTER_DATA_DIR/database"
     
     if grep -q "\[nas_offload\]" "$moonraker_conf" 2>/dev/null; then
         print_warning "nas_offload section already exists in moonraker.conf"
@@ -651,6 +681,9 @@ do_install() {
 [nas_offload]
 nas_mount_point: $NAS_MOUNT
 nas_gcodes_dir: $NAS_GCODES
+local_gcodes_dir: $PRINTER_DATA_DIR/gcodes
+cache_db: $PRINTER_DATA_DIR/database/nas_offload.db
+lock_dir: $PRINTER_DATA_DIR/systemd/nas-offload-locks
 offload_mode: $OFFLOAD_MODE
 offload_on_complete: $OFFLOAD_COMPLETE
 offload_on_cancelled: $OFFLOAD_CANCELLED
